@@ -1,30 +1,24 @@
 """
 WooCommerce REST + WordPress media client.
 
-Resource-safety changes vs. the original:
-  1. EVERY request now has an explicit timeout. The original calls used the
-     `requests` default, which is None (wait forever). One slow response would
-     hang a worker thread permanently; under load every thread hangs and the
-     server dies silently. This is fixed here.
-  2. The image upload decodes Base64 into an io.BytesIO buffer, drops the big
-     string reference immediately, and closes the buffer in `finally` so the
-     decoded bytes do not linger in RAM. Prevents OOM under concurrent load.
-  3. A single shared `requests.Session` reuses TCP connections instead of
-     opening a fresh socket per call.
-
-Note on time.sleep():
-  wc_put still uses time.sleep() for rate-limit backoff and pacing. That is
-  acceptable ONLY because this module runs inside a background threadpool, not
-  on the asyncio event loop. If you ever call these functions from an async
-  context directly, switch to asyncio.sleep.
+Upgraded features:
+  - Connection pooling with automatic exponential backoff retry on 429/5xx via urllib3 Retry.
+  - Image deduplication: computes MD5 hash and caches URL in Redis/memory to avoid re-uploading identical media.
+  - Category caching: eliminates duplicate category lookup requests.
+  - Cached SKU-to-ID catalog map (stored in Redis) to prevent hammering WooCommerce every 15 minutes during stock sync.
+  - Order querying helpers with pagination and date filters for reconciliation.
 """
 
 import base64
 import io
+import json
 import logging
 import time
+from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
 from config import (
     WC_URL,
@@ -35,12 +29,28 @@ from config import (
     HTTP_TIMEOUT,
     IMAGE_TIMEOUT,
     DEBUG,
+    STOCK_CACHE_TTL,
 )
+from utils import compute_md5
 
 logger = logging.getLogger("woocommerce_client")
 
-# Shared session -> connection pooling / keep-alive across calls.
+# Configure session with robust retry strategy
 _session = requests.Session()
+_retries = Retry(
+    total=3,
+    backoff_factor=1.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    raise_on_status=False,
+)
+_adapter = HTTPAdapter(max_retries=_retries, pool_connections=10, pool_maxsize=20)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
+
+# In-memory category cache
+_category_cache: dict[str, dict] = {}
+# In-memory image hash cache (fallback if Redis is not passed)
+_image_hash_cache: dict[str, str] = {}
 
 
 def wc_auth_params() -> dict:
@@ -52,63 +62,62 @@ def wc_auth_params() -> dict:
 
 def _debug(label: str, response: requests.Response) -> None:
     if DEBUG:
-        logger.debug("%s status=%s body=%s", label, response.status_code, response.text)
+        logger.debug("%s status=%s body=%s", label, response.status_code, response.text[:500])
+
+
+def _request(method: str, path: str, params: dict | None = None, json_data: dict | None = None, timeout: tuple = HTTP_TIMEOUT):
+    """Centralized request handler with auth, timeout, and response checks."""
+    all_params = dict(params or {})
+    all_params.update(wc_auth_params())
+
+    url = f"{WC_URL}{path}"
+    response = _session.request(
+        method=method,
+        url=url,
+        params=all_params,
+        json=json_data,
+        timeout=timeout,
+    )
+    _debug(f"WooCommerce {method.upper()} {path}", response)
+
+    if response.status_code == 429:
+        retry_after = int(response.headers.get("Retry-After", 5))
+        logger.warning("WooCommerce 429 Rate Limit. Sleeping %ds before single final retry...", retry_after)
+        time.sleep(retry_after)
+        response = _session.request(
+            method=method,
+            url=url,
+            params=all_params,
+            json=json_data,
+            timeout=timeout,
+        )
+
+    response.raise_for_status()
+    return response.json()
 
 
 def wc_get(path: str, params: dict | None = None):
-    params = dict(params or {})
-    params.update(wc_auth_params())
-
-    response = _session.get(
-        f"{WC_URL}{path}",
-        params=params,
-        timeout=HTTP_TIMEOUT,
-    )
-    _debug("WooCommerce GET", response)
-    response.raise_for_status()
-    return response.json()
+    return _request("GET", path, params=params)
 
 
 def wc_post(path: str, payload: dict):
-    response = _session.post(
-        f"{WC_URL}{path}",
-        params=wc_auth_params(),
-        json=payload,
-        timeout=HTTP_TIMEOUT,
-    )
-    _debug("WooCommerce POST", response)
-    response.raise_for_status()
-    return response.json()
+    return _request("POST", path, json_data=payload)
 
 
 def wc_put(path: str, payload: dict):
-    response = _session.put(
-        f"{WC_URL}{path}",
-        params=wc_auth_params(),
-        json=payload,
-        timeout=HTTP_TIMEOUT,
-    )
-
-    # Simple single-retry on rate limit.
-    if response.status_code == 429:
-        logger.warning("WooCommerce rate limit (429). Retrying in 10s...")
-        time.sleep(10)  # OK: background threadpool, not the event loop.
-        response = _session.put(
-            f"{WC_URL}{path}",
-            params=wc_auth_params(),
-            json=payload,
-            timeout=HTTP_TIMEOUT,
-        )
-
-    _debug("WooCommerce PUT", response)
-    response.raise_for_status()
-
-    # Gentle pacing so a burst of edits does not hammer the API.
-    time.sleep(0.3)  # OK: background threadpool, not the event loop.
-    return response.json()
+    data = _request("PUT", path, json_data=payload)
+    time.sleep(0.15)  # gentle pacing
+    return data
 
 
-def find_product_by_sku(sku: str):
+def wc_delete(path: str, params: dict | None = None):
+    return _request("DELETE", path, params=params)
+
+
+# --------------------------------------------------------------------------
+# Product & Category Lookups
+# --------------------------------------------------------------------------
+def find_product_by_sku(sku: str) -> dict | None:
     products = wc_get(
         "/wp-json/wc/v3/products",
         params={"sku": sku},
@@ -116,53 +125,84 @@ def find_product_by_sku(sku: str):
     return products[0] if products else None
 
 
-def find_category_by_name(category_name: str):
+def find_category_by_name(category_name: str) -> dict | None:
+    category_name_clean = category_name.strip()
+    if category_name_clean.lower() in _category_cache:
+        return _category_cache[category_name_clean.lower()]
+
     categories = wc_get(
         "/wp-json/wc/v3/products/categories",
-        params={"search": category_name, "per_page": 100},
+        params={"search": category_name_clean, "per_page": 100},
     )
     for category in categories:
-        if category["name"].lower() == category_name.lower():
+        if category["name"].strip().lower() == category_name_clean.lower():
+            _category_cache[category_name_clean.lower()] = category
             return category
     return None
 
 
-def create_category(category_name: str):
-    response = _session.post(
-        f"{WC_URL}/wp-json/wc/v3/products/categories",
-        params=wc_auth_params(),
-        json={"name": category_name},
-        timeout=HTTP_TIMEOUT,
+def create_category(category_name: str) -> dict:
+    category_name_clean = category_name.strip()
+    cat = wc_post(
+        "/wp-json/wc/v3/products/categories",
+        payload={"name": category_name_clean},
     )
-    _debug("WooCommerce CATEGORY POST", response)
-    response.raise_for_status()
-    return response.json()
+    _category_cache[category_name_clean.lower()] = cat
+    return cat
 
 
-def get_or_create_category(category_name: str):
+def get_or_create_category(category_name: str) -> dict:
     existing = find_category_by_name(category_name)
     if existing:
         return existing
     return create_category(category_name)
 
 
-def upload_product_image_from_base64(image_base64: str | None, sku: str) -> str | None:
+# --------------------------------------------------------------------------
+# Image Upload with Deduplication
+# --------------------------------------------------------------------------
+def upload_product_image_from_base64(
+    image_base64: str | None,
+    sku: str,
+    redis_client: Any | None = None,
+) -> str | None:
     """
-    Decode a Base64 image and upload it to the WordPress media library.
+    Decode Base64 image and upload to WordPress Media library.
 
-    Memory-safe: decodes once into an io.BytesIO buffer, drops the source
-    string reference, and closes the buffer in `finally`. Returns the public
-    media source_url, or None on missing input / failure.
+    Prevents duplicates:
+      1. Hashes raw image bytes with MD5.
+      2. Checks Redis/memory cache `wc:imghash:<sku>`. If hash matches, returns
+         cached URL without uploading again.
+      3. Closes buffer immediately in `finally` to prevent memory leaks.
     """
     if not image_base64:
         return None
 
     buffer: io.BytesIO | None = None
     try:
-        # Decode straight into a buffer; then release the big base64 string.
-        buffer = io.BytesIO(base64.b64decode(image_base64))
-        image_base64 = None  # drop the large string reference ASAP
+        raw_bytes = base64.b64decode(image_base64)
+        image_base64 = None  # drop large string immediately
 
+        img_hash = compute_md5(raw_bytes)
+        cache_key = f"wc:imghash:{sku}"
+
+        # 1. Check Redis or in-memory cache
+        if redis_client:
+            try:
+                cached_data = redis_client.get(cache_key)
+                if cached_data:
+                    cached_obj = json.loads(cached_data) if isinstance(cached_data, str) else cached_data
+                    if cached_obj.get("hash") == img_hash and cached_obj.get("url"):
+                        logger.debug("Image for SKU %s unchanged; reusing URL: %s", sku, cached_obj["url"])
+                        return cached_obj["url"]
+            except Exception:
+                logger.warning("Redis image hash lookup failed for sku=%s", sku)
+        elif _image_hash_cache.get(sku) == img_hash:
+            logger.debug("Image for SKU %s unchanged (in-memory match)", sku)
+            return None  # No upload needed
+
+        # 2. Upload to WordPress media
+        buffer = io.BytesIO(raw_bytes)
         filename = f"{sku}.jpg"
         headers = {
             "Content-Disposition": f'attachment; filename="{filename}"',
@@ -174,33 +214,40 @@ def upload_product_image_from_base64(image_base64: str | None, sku: str) -> str 
             f"{WC_URL}/wp-json/wp/v2/media",
             auth=(WP_USERNAME, WP_APP_PASSWORD),
             headers=headers,
-            data=buffer,            # streamed from the buffer, not a raw bytes copy
-            timeout=IMAGE_TIMEOUT,  # longer read window for large uploads
+            data=buffer,
+            timeout=IMAGE_TIMEOUT,
         )
         _debug("WordPress MEDIA POST", response)
         response.raise_for_status()
 
-        return response.json().get("source_url")
+        uploaded_url = response.json().get("source_url")
+
+        # 3. Store hash in cache
+        if uploaded_url:
+            if redis_client:
+                try:
+                    redis_client.set(cache_key, json.dumps({"hash": img_hash, "url": uploaded_url}), ex=86400 * 30)
+                except Exception:
+                    pass
+            _image_hash_cache[sku] = img_hash
+
+        return uploaded_url
 
     except Exception:
         logger.exception("Image upload failed for sku=%s", sku)
         return None
-
     finally:
         if buffer is not None:
             buffer.close()
 
 
 # --------------------------------------------------------------------------
-# Stock-sync helpers (used by stock_sync.py)
+# Stock-sync Helpers & SKU Map Caching
 # --------------------------------------------------------------------------
 def iter_wc_products_sku_map(per_page: int = 100) -> dict[str, int]:
     """
-    Build a {sku: woo_product_id} map for the whole catalog, paging through the
-    products endpoint. Requests only id+sku (_fields=) so each page is small.
-
-    Cheap on RAM: only two fields per product are pulled, and we keep just the
-    map (sku -> id), not the product bodies.
+    Fetch all {sku: woo_product_id} mappings from WooCommerce across all pages.
+    Pulls minimal fields: id, sku.
     """
     sku_to_id: dict[str, int] = {}
     page = 1
@@ -210,7 +257,7 @@ def iter_wc_products_sku_map(per_page: int = 100) -> dict[str, int]:
             params={
                 "per_page": per_page,
                 "page": page,
-                "_fields": "id,sku",   # minimal payload
+                "_fields": "id,sku",
             },
         )
         if not batch:
@@ -218,23 +265,43 @@ def iter_wc_products_sku_map(per_page: int = 100) -> dict[str, int]:
         for prod in batch:
             sku = prod.get("sku")
             if sku:
-                sku_to_id[sku] = prod["id"]
+                sku_to_id[sku.strip()] = prod["id"]
         if len(batch) < per_page:
-            break  # last page
+            break
         page += 1
     return sku_to_id
 
 
-def wc_batch_update_stock(updates: list[dict]):
+def get_cached_wc_sku_map(redis_client: Any | None = None, force_refresh: bool = False) -> dict[str, int]:
     """
-    Update stock for many products in one call via the WooCommerce batch
-    endpoint. `updates` items look like:
-        {"id": 62645, "stock_quantity": 30,
-         "stock_status": "instock", "manage_stock": True}
+    Get SKU -> WooCommerce ID map, cached in Redis with STOCK_CACHE_TTL.
+    Avoids fetching the full catalog every cycle.
+    """
+    cache_key = "wc:sku_to_id_map"
+    if redis_client and not force_refresh:
+        try:
+            cached = redis_client.get(cache_key)
+            if cached:
+                logger.info("Loaded WooCommerce SKU->ID map from Redis cache.")
+                return json.loads(cached)
+        except Exception:
+            logger.warning("Redis error reading SKU map cache.")
 
-    WooCommerce caps batch ops (commonly ~100 items), so callers should chunk.
-    Returns the parsed response, or None if there was nothing to send.
-    """
+    # Fresh load
+    logger.info("Fetching fresh WooCommerce SKU->ID map from API...")
+    mapping = iter_wc_products_sku_map()
+
+    if redis_client and mapping:
+        try:
+            redis_client.set(cache_key, json.dumps(mapping), ex=STOCK_CACHE_TTL)
+        except Exception:
+            pass
+
+    return mapping
+
+
+def wc_batch_update_stock(updates: list[dict]):
+    """Update stock for multiple products in a single batch call."""
     if not updates:
         return None
     response = _session.post(
@@ -245,5 +312,31 @@ def wc_batch_update_stock(updates: list[dict]):
     )
     _debug("WooCommerce BATCH stock update", response)
     response.raise_for_status()
-    time.sleep(0.3)  # gentle pacing
+    time.sleep(0.15)
     return response.json()
+
+
+# --------------------------------------------------------------------------
+# Order Querying & Status Helpers
+# --------------------------------------------------------------------------
+def get_wc_order(wc_order_id: int) -> dict:
+    """Fetch order details for a given ID."""
+    return wc_get(f"/wp-json/wc/v3/orders/{wc_order_id}")
+
+
+def get_wc_orders(status: str | None = None, after: str | None = None, page: int = 1, per_page: int = 50) -> list[dict]:
+    """Query orders with status and date filters (for reconciliation)."""
+    params: dict[str, Any] = {"page": page, "per_page": per_page}
+    if status:
+        params["status"] = status
+    if after:
+        params["after"] = after
+    return wc_get("/wp-json/wc/v3/orders", params=params)
+
+
+def update_wc_order_status(wc_order_id: int, new_status: str, customer_note: str | None = None) -> dict:
+    """Update WooCommerce order status (e.g. 'completed', 'cancelled')."""
+    payload: dict[str, Any] = {"status": new_status}
+    if customer_note:
+        payload["customer_note"] = customer_note
+    return wc_put(f"/wp-json/wc/v3/orders/{wc_order_id}", payload=payload)
